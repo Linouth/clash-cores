@@ -186,6 +186,26 @@ library
     Clash.Cores.Xilinx.Xpm.Cdc.Pulse
     Clash.Cores.Xilinx.Xpm.Cdc.Single
     Clash.Cores.Xilinx.Xpm.Cdc.SyncRst
+    Clash.Cores.Xilinx.Ethernet.Gmii
+    Clash.Cores.Xilinx.Ethernet.Gmii.Internal
+
+    Clash.Cores.Sgmii
+    Clash.Cores.Sgmii.AutoNeg
+    Clash.Cores.Sgmii.BitSlip
+    Clash.Cores.Sgmii.Common
+    Clash.Cores.Sgmii.PcsReceive
+    Clash.Cores.Sgmii.PcsTransmit
+    Clash.Cores.Sgmii.PcsTransmit.CodeGroup
+    Clash.Cores.Sgmii.PcsTransmit.OrderedSet
+    Clash.Cores.Sgmii.RateAdapt
+    Clash.Cores.Sgmii.Sync
+
+    Clash.Cores.Etherbone
+    Clash.Cores.Etherbone.Base
+    Clash.Cores.Etherbone.RecordBuilder
+    Clash.Cores.Etherbone.RecordProcessor
+    Clash.Cores.Etherbone.WishboneMaster
+
 
   other-modules:
     Clash.Signal.Extra

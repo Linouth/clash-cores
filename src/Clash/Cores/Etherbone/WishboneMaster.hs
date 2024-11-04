@@ -11,18 +11,22 @@ import Data.Maybe
 import qualified Prelude as P
 -- import Debug.Trace
 
-trace :: a -> b -> b
-trace _ x = x
-
 type ByteSize dat = BitSize dat `DivRU` 8
 
 data WishboneMasterInput addrWidth selWidth dat
   = WishboneMasterInput
-  { _addr    :: BitVector addrWidth
-  , _dat     :: Maybe dat
-  , _sel     :: BitVector selWidth
-  , _dropCyc :: Bool
+  { _addr   :: BitVector addrWidth
+  , _dat    :: Maybe dat
+  , _sel    :: BitVector selWidth
+  , _last   :: Bool
+  , _abort  :: Bool
   } deriving (Generic, NFDataX, Show)
+
+data WishboneMasterOutput dat
+  = WishboneMasterOutput
+  { _wbDatOut  :: Maybe dat
+  , _wbLastOut :: Bool
+  }
 
 data WishboneMasterState addrWidth selWidth dat
   = WaitForOp  { _cyc :: Bool }
@@ -32,6 +36,8 @@ data WishboneMasterState addrWidth selWidth dat
   | WaitForAck { _cyc :: Bool, _retDat :: dat }
   deriving (Generic, NFDataX, Show)
 
+
+{-
 -- TODO: Property test this transfer function
 --
 -- Backpressure is generated and handled through the Df line. If the Processor
@@ -51,11 +57,11 @@ wishboneMasterT ::
   , Show dat
   , ShowX dat
   )
-  => WishboneMasterState addrWidth (ByteSize dat) dat
-  -> ( Maybe (WishboneMasterInput addrWidth (ByteSize dat) dat)
+  => WishboneMasterState addrWidth dat
+  -> ( Maybe (WishboneMasterInput addrWidth dat)
      , (Ack, WishboneS2M dat, ()), Unsigned 8
      )
-  -> ( WishboneMasterState addrWidth (ByteSize dat) dat
+  -> ( WishboneMasterState addrWidth dat
      , ((), ( Df.Data dat
             , WishboneM2S addrWidth (ByteSize dat) dat
             , Maybe Bit
@@ -119,7 +125,9 @@ wishboneMasterT state (input, (ack, wbBwd, ()), count)
     fsm st@WaitForAck{} _ _ (Ack False) = st
     fsm WaitForAck{..} _ _ (Ack True) = WaitForOp _cyc
     -- fsm WaitForAck{} (Just x) _ (Ack True) = Busy x
+-}
 
+{-
 wishboneMasterC
   :: forall dom addrWidth dat .
   ( HiddenClockResetEnable dom, KnownNat addrWidth, BitPack dat, NFDataX dat, Show dat, ShowX dat )
@@ -134,6 +142,16 @@ wishboneMasterC = Circuit go
     fsm (fwd, bwd) = mealyB wishboneMasterT (WaitForOp False) (fwd, bwd, count)
 
     count = register 0 (count + 1)
+-}
+
+{-
+wishboneMasterC ::
+  Circuit (Df dom (WishboneMasterInput addrWidth dat))
+          (Df dom (WishboneMasterOutput dat), CSignal dom (Maybe Bit), Wishbone dom Standard addrWidth dat)
+wishboneMasterC = Circuit (B.second unbundle . go . B.second bundle)
+  where
+    go = mealyB wishboneMasterT _
+-}
 
 
 type WBData = BitVector 32

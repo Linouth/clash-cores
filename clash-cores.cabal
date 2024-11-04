@@ -243,6 +243,8 @@ test-suite unittests
 
   other-Modules:
     Test.Cores.Crc
+    Test.Cores.Etherbone
+    Test.Cores.Etherbone.WishboneMaster
     Test.Cores.Ethernet
     Test.Cores.Ethernet.Arp.ArpManager
     Test.Cores.Ethernet.Base

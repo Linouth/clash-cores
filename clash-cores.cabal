@@ -200,10 +200,10 @@ library
     Clash.Cores.Sgmii.RateAdapt
     Clash.Cores.Sgmii.Sync
 
-    Clash.Cores.Etherbone
+    -- Clash.Cores.Etherbone
     Clash.Cores.Etherbone.Base
-    Clash.Cores.Etherbone.RecordBuilder
-    Clash.Cores.Etherbone.RecordProcessor
+    -- Clash.Cores.Etherbone.RecordBuilder
+    -- Clash.Cores.Etherbone.RecordProcessor
     Clash.Cores.Etherbone.WishboneMaster
 
 

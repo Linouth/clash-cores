@@ -6,274 +6,201 @@ module Clash.Cores.Etherbone.RecordProcessor where
 import Clash.Prelude
 
 import Clash.Cores.Etherbone.Base
-import Clash.Cores.Etherbone.WishboneMaster (WishboneMasterInput (..), ByteSize, WBData)
 
 import Protocols
 import Protocols.PacketStream
 import qualified Protocols.Df as Df
 
 import qualified Data.Bifunctor as B
-import qualified Prelude as P
 import Data.Maybe
-import Debug.Trace
+import Control.DeepSeq (NFData)
 
+
+-- | This is the data sent over the bypass line.
+-- It is not assured that the data on the bypass line is in sync with the data
+-- returned from the WishboneMaster. This means that the RecordBuilder should
+-- save the header and base address in its state.
+--
+-- By using a bypass line the state machine of the WishboneMaster can be made
+-- simpler and the RecordBuilder can know about the number of reads and writes
+-- before an operation is finished.
+data Bypass addrWidth = Bypass
+  -- | The @RecordHeader@ from the @_meta@ field.
+  { _bpHeader :: RecordHeader
+  -- | The @BaseRetAddr@ that needs to be returned if a read operation has is
+  -- sent.
+  , _bpBase   :: Maybe (BitVector addrWidth)
+  -- | The @_abort@ signal from the PacketStream. If this is @True@, no new data
+  -- will come from the @WishboneMaster@ and the @RecordBuilder@ should be set
+  -- back into its initial state.
+  , _bpAbort  :: Bool
+  } deriving (Generic, NFDataX, NFData, Show, ShowX, Eq)
 
 data RecordProcessorState addrWidth
+  -- | Initial state of the @RecordProcessor@.
+  -- In this state either a @BaseWriteAddr@ or a @BaseRetAddr@ is received. The
+  -- @_wCount@ and @_rCount@ fields determine whether the next state is @Write@
+  -- or @Read@.
   = WriteOrReadAddr
+  -- | State to handle Write operations.
+  -- When @_writesLeft == 1@ the state progresses to @ReadAddr@ or back to
+  -- @WriteOrReadAddr@.
   | Write { _writesLeft :: Unsigned 8
-          , _addr :: BitVector addrWidth }
+          -- ^ Number of write operations left to fullfill.
+          , _addr :: BitVector addrWidth
+          -- ^ The (incrementing) address to write to.
+          }
+  -- | Handle the @BaseRetAddr@. This is sent over the Bypass line.
   | ReadAddr
+  -- | Handle Read operations.
+  -- When @_readsLeft == 1@ the state is set back to @WriteOrReadAddr@.
   | Read  { _readsLeft :: Unsigned 8 }
-  | Aborted
-  deriving (Generic, NFDataX, Show, ShowX)
+  deriving (Show, Generic, ShowX, NFDataX)
 
-
-recordProcessorT :: forall addrWidth dataWidth dat .
+recordProcessorT :: forall dataWidth addrWidth dat selWidth .
   ( KnownNat dataWidth
   , KnownNat addrWidth
   , BitPack dat
   , BitSize dat ~ dataWidth * 8
-  , addrWidth <= BitSize dat
-  )
+  , Show dat
+  , selWidth ~ dataWidth)
   => RecordProcessorState addrWidth
-  -> ( ( Maybe (PacketStreamM2S dataWidth RecordHeader)
-       , Df.Data dat
-       )
-     , (PacketStreamS2M, ())
+  -> ( Maybe (PacketStreamM2S dataWidth RecordHeader)
+     , (Ack, ())
      )
   -> ( RecordProcessorState addrWidth
-     , ( (PacketStreamS2M, Ack)
-       , ( Maybe (PacketStreamM2S dataWidth RecordHeader)
-         , Maybe (WishboneMasterInput addrWidth (ByteSize dat) dat)
+     , ( PacketStreamS2M
+       , ( Df.Data (WishboneOperation addrWidth selWidth dat)
+         , Maybe (Bypass addrWidth)
          )
        )
      )
-recordProcessorT state ((Nothing, _), _)
-  = (state, ((PacketStreamS2M True, Ack False), (Nothing, Nothing)))
-recordProcessorT state ((Just psIn, df), (bpOut@PacketStreamS2M{_ready}, ()))
-  = (nextState, ((PacketStreamS2M bpIn, Ack ack), (psOut, wbOut)))
+-- No data in -> no data out
+recordProcessorT state (Nothing, _)
+  = (state, (PacketStreamS2M True, (Df.NoData, Nothing)))
+-- If in the initial state and abort is asserted, stay in this state.
+recordProcessorT WriteOrReadAddr (Just PacketStreamM2S{_abort=True}, _)
+  = (WriteOrReadAddr, (PacketStreamS2M True, (Df.NoData, Nothing)))
+recordProcessorT state (Just psFwd, (Ack wbAck, ()))
+  = (nextState, (PacketStreamS2M psBwd, (wbOut, bpOut)))
   where
-    -- Do _not_ progress to the next state if we receive backpressure.
-    -- If the WBM is still busy with an operation, `fsm` does not progress the
-    -- state.
-    nextState = if _ready then state' else trace (show state) state
-    state' = fsm state psIn df
+    nextState
+      | ack       = state'
+      | otherwise = state
+    state' = fsm state psFwd
 
-    psWord = pack (_data psIn)
+    psWord = pack $ _data psFwd
+    hdr = _meta psFwd
 
-    -- Whenever the WBM is busy, give backpressure.
-    -- Otherwise forward the backpressure from right to left
-    --
-    -- If WBM provides Data but we receive backpressure, we should forward this
-    -- backpressure as otherwise words will be lost.
-    bpIn = case (state, df) of
-      (Write _ _, Df.NoData) -> False
-      (Read _,    Df.NoData) -> False
-      -- ? Is there backpressure missing for the one cycle where _abort is set
-      -- high? It can happen that that also has _last set and then we will miss
-      -- it.
-      -- TODO: Fix, or think of this in the new implementation.
-      (Aborted,   Df.NoData) -> False
-      _                      -> _ready
+    -- Cannot read the Ack channels if the forward channels are NoData. 
+    ack = case state of
+      WriteOrReadAddr -> True
+      ReadAddr        -> True
+      _               -> wbAck
+    psBwd = ack
 
-    -- Only Ack if we do not receive backpressure
-    -- This results in the WBM waiting until the pipeline is ready again.
-    ack = case (state, df) of
-      (Write _ _, Df.Data _) -> _ready
-      (Read _,    Df.Data _) -> _ready
-      (Aborted,   Df.Data _) -> True
-      _                      -> False
-
-    -- Should only send a fragment if
-    --   BaseRetAddr is being read
-    --   or Read operation from WBM is finished
-    --
-    -- If the WBM is reading, is first busy and then finishes while
-    -- we are receiving backpressure, the output fragment changes from Nothing
-    -- to the read data.
-    psOut = case (state, state', df) of
-      -- BaseRetAddr is being handled
-      (WriteOrReadAddr, Read _, _) -> Just $ psIn { _data = unpack psWord }
-      (ReadAddr, _, _)             -> Just $ psIn { _data = unpack psWord }
-      -- Read op finished
-      (Read _, _, Df.Data d)       -> Just $ psIn { _data = bitCoerce d }
-      _                            -> Nothing
-
-    -- If the drop cyc flag is set in the RecordHeader, the busCycle line should
-    -- be deasserted after the last entry in the record.
+    -- Only write wishbone operations in the @Write@ or @Read@ state
     wbOut = case state of
-      -- dropCyc takes i + _rCount, since cyc should be kept high after a write
-      -- if there are still reads to do.
-      Write i a -> Just $ WishboneMasterInput a (Just dat) sel (dropCyc $ i + _rCount (_meta psIn))
-      Read i    -> Just $ WishboneMasterInput addr Nothing sel (dropCyc i)
-      _         -> Nothing
+      Write i a -> Df.Data (WishboneOperation a (Just dat) sel isLast abort (dropCyc $ i + _rCount hdr) wca)
+      Read i    -> Df.Data (WishboneOperation addr Nothing sel isLast abort (dropCyc i) rca)
+      _         -> Df.NoData
       where
-        dat = bitCoerce (_data psIn)
-        sel = resize $ _byteEn (_meta psIn)
+        dat = bitCoerce $ _data psFwd
+        isLast = isJust $ _last psFwd
+        sel = resize $ _byteEn hdr
+        abort = _abort psFwd
 
-        -- Drop cyc if
-        --   This is the last packet (safety measure)
-        --   or
-        --   This is the last entry from this record, and the dropCyc flag is
-        --   set in the record header.
-        -- TODO: MultiRecord: Once multiple records are handled, check the EB packet last
-        --  flag rather than the current record packet's _last flag.
-        dropCyc i = isJust (_last psIn) || (i == 1 && _cyc (_meta psIn))
+        -- Drop @CYC@ if this was requested. Also drop if this is the last
+        -- fragment of the packet.
+        -- NOTE: With no support for multiple records yet, this means that @CYC@
+        -- is set low at the end of each Etherbone packet.
+        dropCyc left = isJust (_last psFwd) || (left == 1 && _cyc hdr)
 
-        addr :: BitVector addrWidth
         addr = resize psWord
+
+        wca = if _wca hdr then ConfigAddressSpace else WishboneAddressSpace
+        rca = if _rca hdr then ConfigAddressSpace else WishboneAddressSpace
+
+    -- The bypass line always receives data if data is streaming in.
+    bpOut = Just $ Bypass hdr base (_abort psFwd)
+      where
+        base = case (state, state') of
+          (WriteOrReadAddr, Read _) -> Just $ resize psWord
+          (ReadAddr, _)             -> Just $ resize psWord
+          _ -> Nothing
 
     fsm
       :: RecordProcessorState addrWidth
       -> PacketStreamM2S dataWidth RecordHeader
-      -> Df.Data dat
       -> RecordProcessorState addrWidth
-    fsm _ PacketStreamM2S{_abort = True} _ = Aborted
-    fsm st@WriteOrReadAddr (PacketStreamM2S{..}) _ = st'
+    -- If this is the last fragment of the packet, jump back to the initial
+    -- state.
+    fsm _ PacketStreamM2S{_last}
+      | _last == Just maxBound = WriteOrReadAddr
+    fsm st@WriteOrReadAddr PacketStreamM2S{..} = st'
       where
         wCount = _wCount _meta
         rCount = _rCount _meta
 
         st'
-          | isJust _last = WriteOrReadAddr
           | wCount > 0 = Write wCount $ resize psWord
           | rCount > 0 = Read rCount
-          | otherwise = st
-
-    fsm st@Write{} _ Df.NoData = st
-    fsm Write{..} (PacketStreamM2S{..}) (Df.Data _) = st'
+          | otherwise  = st
+    fsm Write{..} PacketStreamM2S{..} = st'
       where
         wCount = _writesLeft
         wCount' = wCount - 1
         rCount = _rCount _meta
 
         addr'
+          -- If @wff@ is set, the write address is a FIFO and should not
+          -- increment.
           | _wff _meta = _addr
           | otherwise  = _addr + (natToNum @dataWidth)
-
+        
         st'
-          | isJust _last = WriteOrReadAddr
-          | wCount' == 0 = if rCount == 0 then WriteOrReadAddr else ReadAddr
+          | wCount' == 0 =
+            if rCount > 0
+              then ReadAddr
+              else WriteOrReadAddr
           | otherwise = Write wCount' addr'
-
-    fsm ReadAddr (PacketStreamM2S{..}) _ = st'
+    fsm ReadAddr PacketStreamM2S{..} = Read rCount
       where
         rCount = _rCount _meta
-
-        st'
-          | isJust _last = WriteOrReadAddr
-          | rCount > 0 = Read rCount
-          | otherwise  = WriteOrReadAddr
-
-    fsm st@Read{} _ Df.NoData = st
-    fsm Read{..} (PacketStreamM2S{..}) (Df.Data _) = st'
+    fsm Read{..} PacketStreamM2S{} = st'
       where
         rCount = _readsLeft
         rCount' = rCount - 1
 
         st'
-          | isJust _last = WriteOrReadAddr
           | rCount' == 0 = WriteOrReadAddr
           | otherwise    = Read rCount'
-    fsm st@Aborted PacketStreamM2S{} Df.NoData = st
-    fsm st@Aborted PacketStreamM2S{..} (Df.Data _) = st'
-      where
-        st'
-          | isJust _last = WriteOrReadAddr
-          | otherwise = st
 
 
-recordProcessorC ::
+-- | Converts a @PacketStream@ of a Record into separate operations for the
+-- @WishboneMaster@.
+-- It also bypasses the @WishboneMaster@ with the @RecordHeader@ so that the
+-- @RecordBuilder@ does not have to wait for the wishbone bus to start
+-- constructing the response. The bypass line also holds the @BaseRetAddr@
+-- required in the response in the case of reads, and an abort signal.
+--
+-- This circuit makes use of the fact that the depacketizers set @_abort@ for
+-- the rest of a packet if it was toggled. This means that there is no need to
+-- have an additional state to handle aborts.
+--
+-- This circuit assumes that @_last@ is set to @maxBound@ with the final
+-- fragment of a packet.
+recordProcessorC :: forall dom dataWidth addrWidth dat selWidth .
   ( HiddenClockResetEnable dom
   , KnownNat dataWidth
   , KnownNat addrWidth
   , BitPack dat
+  , Show dat
   , BitSize dat ~ dataWidth * 8
-  , addrWidth <= BitSize dat
+  , selWidth ~ dataWidth
   )
-  => Circuit ( PacketStream dom dataWidth RecordHeader
-             , Df dom dat)
-             ( PacketStream dom dataWidth RecordHeader
-             , CSignal dom (Maybe (WishboneMasterInput addrWidth (ByteSize dat) dat)))
-recordProcessorC = Circuit (B.bimap unbundle unbundle . fsm . B.bimap bundle bundle)
+  => Circuit (PacketStream dom dataWidth RecordHeader)
+               (Df.Df dom (WishboneOperation addrWidth selWidth dat), CSignal dom (Maybe (Bypass addrWidth)))
+recordProcessorC = forceResetSanity |> Circuit (B.second unbundle . fsm . B.second bundle)
   where
-    fsm (fwd, bwd) = mealyB recordProcessorT WriteOrReadAddr (fwd, bwd)
-
-
-type RpInput dataWidth dat = ( ( Maybe (PacketStreamM2S dataWidth RecordHeader)
-                               , Df.Data dat
-                               )
-                             , (PacketStreamS2M, ()) )
-
-type RpOutput addrWidth dataWidth dat = ( (PacketStreamS2M, Ack)
-                                        , ( Maybe (PacketStreamM2S dataWidth RecordHeader)
-                                          , Maybe (WishboneMasterInput addrWidth (ByteSize dat) dat)
-                                          ) )
-
-rpSim :: forall addrWidth dataWidth dat .
-  ( KnownNat addrWidth
-  , KnownNat dataWidth
-  , BitPack dat
-  , BitSize dat ~ dataWidth * 8
-  , addrWidth <= dataWidth * 8
-  )
-  => [RpInput dataWidth dat]
-  -> ([RecordProcessorState addrWidth], [RpOutput addrWidth dataWidth dat])
-rpSim inputs = P.foldl fn ([WriteOrReadAddr], []) inputs
-  where
-    fn :: ( [RecordProcessorState addrWidth]
-          , [RpOutput addrWidth dataWidth dat])
-       -> RpInput dataWidth dat
-       -> ( [RecordProcessorState addrWidth]
-          , [RpOutput addrWidth dataWidth dat])
-    fn (states, results) input = (states P.++ [newState], results P.++ [result])
-      where
-        (newState, result) = recordProcessorT (P.last states) input
-
-rpInput :: [RpInput (ByteSize WBData) WBData]
-rpInput = [ pkt 1 0 False True 0xaaaaaaaa Nothing
-          , pkt 1 0 False True 0xdeadbeef Nothing
-          , pkt 1 0 False True 0xdeadbeef Nothing
-          , pkt 1 0 True  True 0xdeadbeef (Just 0)
-          , pkt 0 0 True  True 0x00000000 Nothing
-          , pkt 0 2 False True 0xbbbbbbbb Nothing
-          , pkt 0 2 False True 0xcccccccc Nothing
-          , pkt 0 2 False True 0xcccccccc Nothing
-          , pkt 0 2 False True 0xcccccccc Nothing
-          , pkt 0 2 False True 0xcccccccc Nothing
-          , pkt 0 2 False False 0xcccccccc (Just 0xcafecafe)
-          , pkt 0 2 False True 0xcccccccc (Just 0xcafecafe) -- Here fst is done
-          -- Single cycle second read
-          , pkt 0 2 True  True 0xdddddddd (Just 0xffffffff)
-          ]
-  where
-    pkt
-      :: Unsigned 8
-      -> Unsigned 8
-      -> Bool
-      -> Bool
-      -> WBData
-      -> Maybe WBData
-      -> RpInput (ByteSize WBData) WBData
-    pkt wCount rCount lastFrag bp psDat wbRet =
-      ( (Just ps, Df.maybeToData wbRet)
-      , (PacketStreamS2M bp, ())
-      )
-      where
-        ps = PacketStreamM2S (bitCoerce psDat) (if lastFrag then Just 3 else Nothing) meta False
-        meta = RecordHeader
-          { _bca    = False
-          , _rca    = False
-          , _rff    = False
-          , _res0   = 0
-          , _cyc    = True
-          , _wca    = False
-          , _wff    = False
-          , _res1   = 0
-          , _byteEn = 0x0f
-          , _wCount = wCount
-          , _rCount = rCount
-          }
-
--- Run with
--- mapM_ putStrLn [show x P.++ "\n\t" P.++ show y | (x, y) <- uncurry P.zip (rpSim @32 rpInput)]
+    fsm = mealyB recordProcessorT WriteOrReadAddr

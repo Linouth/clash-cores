@@ -1,6 +1,8 @@
 {-# OPTIONS -fplugin=Protocols.Plugin #-}
 
-module Clash.Cores.Etherbone where
+module Clash.Cores.Etherbone (
+  etherboneC
+) where
 
 import Protocols
 import Protocols.PacketStream
@@ -69,7 +71,7 @@ etherboneC = circuit $ \psIn -> do
 
   recordOut' <- traceC "BuilderOut/ArbIn" -< recordOut
 
-  pktOut <- arbiterC -< [recordOut', probeOut]
+  pktOut <- packetArbiterC RoundRobin -< [recordOut', probeOut]
   udpTx <- etherbonePacketizerC <| traceC "EBPktIn" -< pktOut
 
   idC -< (udpTx, wbmBus)
